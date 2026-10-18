@@ -25,6 +25,14 @@ Notes on Bumblebee firmware 2.1 and later:
   selected configuration 1, and CMD_INIT is retried.
 - Missing INIT/SET_CHANNEL/SNIFF_ON/SNIFF_OFF ACKs raise KBInterfaceError
   instead of being ignored.
+
+Firmware with the fixes proposed to virtualabs/cc2531-killerbee-fw fixes the
+IN-queue race and the data toggles in the firmware itself; the measures above
+stay for 2.1r1 dongles. It also reports the radio transmit() result in
+the SEND_PKT ACK and exposes the chip IEEE address as the USB serial number.
+send_packet() returns False when that result is not RADIO_TX_OK; with stock
+firmware (empty ACK) it still returns True on any ACK. The raw result is in
+last_tx_status (None if the firmware did not report one).
 """
 
 from __future__ import print_function # type: ignore
@@ -164,6 +172,12 @@ class Bumblebee(object):
     CMD_SNIFF_OFF_ACK = 0x09
     CMD_GOT_PKT = 0x0A
 
+    # SEND_PKT ACK payload (fixed firmware): Contiki radio transmit() result
+    TX_OK = 0
+    TX_ERR = 1
+    TX_COLLISION = 2
+    TX_STATUS_NAMES = {0: 'ok', 1: 'error', 2: 'collision (CCA busy or RX in progress)', 3: 'no ack'}
+
 
     def __init__(self, dev, bus):
         """
@@ -173,6 +187,8 @@ class Bumblebee(object):
             raise KBInterfaceError("Bumblebee needs a usb.core.Device, got %r" % (dev,))
 
         self.dev = dev
+        self.last_tx_status = None
+        self._last_ack = None
         self.rx_buffer = bytes()
         self._channel = None
         self.__stream_open = False
@@ -196,6 +212,12 @@ class Bumblebee(object):
         usb.util.claim_interface(self.dev, 0)
 
         self.name = usb.util.get_string(self.dev, self.dev.iProduct)
+        self.serial = ""
+        if getattr(self.dev, 'iSerialNumber', 0):
+            try:
+                self.serial = usb.util.get_string(self.dev, self.dev.iSerialNumber) or ""
+            except (usb.core.USBError, ValueError):
+                self.serial = ""
 
         # Keep EP2 IN drained for the lifetime of the driver (see module docstring):
         # queued async transfers, or a blocking-read thread if those are unavailable.
@@ -337,11 +359,19 @@ class Bumblebee(object):
         FCS must not be provided, only packet data. Also, no need to add two
         bytes at the end of the packet to insert FCS.
         """
+        self.last_tx_status = None
         self.send_message(
           Bumblebee.CMD_SEND_PKT,
           packet
         )
-        return self.wait_for_ack(Bumblebee.CMD_SEND_PKT_ACK)
+        if not self.wait_for_ack(Bumblebee.CMD_SEND_PKT_ACK):
+            return False
+        status = self._last_ack.get_data()
+        if len(status) == 0:
+            # Stock firmware: the ACK does not say whether the frame went on air.
+            return True
+        self.last_tx_status = status[0]
+        return self.last_tx_status == Bumblebee.TX_OK
 
 
     def _do_set_channel(self):
@@ -393,6 +423,7 @@ class Bumblebee(object):
             # Check packets
             for pkt in self.process_packet():
               if pkt.get_command() == command_ack:
+                self._last_ack = pkt
                 return True
               if pkt.get_command() == Bumblebee.CMD_GOT_PKT:
                 self._frames.append(pkt)
@@ -441,8 +472,8 @@ class Bumblebee(object):
         @rtype: List
         @return: List of 3 strings identifying device.
         """
-        # TODO Determine if there is a way to get a unique ID from the device
-        return [self.name, "BUMBLEBEE", ""]
+        # Firmware that sets iSerialNumber reports the chip IEEE address; 2.1r1 has none.
+        return [self.name, "BUMBLEBEE", self.serial]
 
     # KillerBee expects the driver to implement this function
     def sniffer_on(self, channel=None, page=0):
